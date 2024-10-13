@@ -11,10 +11,34 @@
  * the TCG CRB 2.0 TPM specification.
  */
 
+#include <linux/virtio.h>
+#include <linux/virtio_tpm.h>
+#include <linux/swap.h>
+#include <linux/workqueue.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
+#include <linux/oom.h>
+#include <linux/wait.h>
+#include <linux/mm.h>
+#include <linux/mount.h>
+#include <linux/magic.h>
+#include <linux/moduleparam.h>
+#include <linux/interrupt.h>
+#include <linux/freezer.h>
+#include <linux/kernel.h>
+#include <linux/spi/spi.h>
+#include <linux/gpio.h>
+#include <linux/of_irq.h>
+#include <linux/of_gpio.h>
+#include <linux/init.h>
 #include <linux/acpi.h>
 #include <linux/highmem.h>
 #include <linux/rculist.h>
+#include <linux/fs.h>
+#include <linux/virtio_fs.h>
+#include <linux/fs_context.h>
 #include <linux/module.h>
+#include <linux/device.h>
 #include <linux/pm_runtime.h>
 #ifdef CONFIG_ARM64
 #include <linux/arm-smccc.h>
@@ -22,6 +46,107 @@
 #include "tpm.h"
 
 #define ACPI_SIG_TPM2 "TPM2"
+#define TPM_CRB_MAX_RESOURCES 3
+
+/*************************virtio*************************** */
+
+static int __init virtio_tpm_init(void) {
+    printk(KERN_INFO "virtio_tpm module loaded\n");
+    return 0;
+}
+static void __exit virtio_tpm_exit(void) {
+    printk(KERN_INFO "virtio_tpm module unloaded\n");
+}
+
+
+struct virtio_tpm {
+    struct virtio_device *vdev;
+	struct virtqueue *request_vq;
+    struct virtqueue *response_vq;
+	struct mutex vdev_mutex;
+};
+
+static struct virtio_device_id id_table[] = {
+    { VIRTIO_ID_TPM, VIRTIO_DEV_ANY_ID },
+    { 0 },
+};
+
+static struct virtio_tpm *vb_dev;
+
+static void tpm_ack(struct virtqueue *vq)
+{
+    struct virtio_tpm *vb = vq->vdev->priv;
+    printk("virttpm get ack\n");
+    unsigned int len;
+    virtqueue_get_buf(vq, &len);
+}
+
+
+
+static void remove_common(struct virtio_tpm *vb)
+{
+    /* Now we reset the device so we can clean up the queues. */
+    vb->vdev->config->reset(vb->vdev);
+
+    vb->vdev->config->del_vqs(vb->vdev);
+}
+
+static void virttpm_remove(struct virtio_device *vdev)
+{
+    struct device *dev = &vdev->dev;
+	struct tpm_chip *chip = dev_get_drvdata(dev);
+	struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
+
+	// 释放 vqs
+	// Copied from drivers/block/virtio_blk.c
+	mutex_lock(&priv->vdev_mutex);
+
+	/* Stop all the virtqueues. */
+	virtio_break_device(vdev);
+
+	/* Virtqueues are stopped, nothing can use vblk->vdev anymore. */
+	priv->vdev = NULL;
+
+	vdev->config->del_vqs(vdev);
+
+	kfree(priv->request_vq);
+	kfree(priv->response_vq);
+
+	mutex_unlock(&priv->vdev_mutex);
+
+	tpm_chip_unregister(chip);       //依赖问题？
+}
+/*
+static int virttpm_validate(struct virtio_device *vdev)
+{
+    return 0;
+}
+*/
+
+/*
+static void virttpm_changed(struct virtio_device *vdev)
+{
+    struct virtio_tpm *vb = vdev->priv;
+    printk("virttpm virttpm_changed\n");
+    if (!vb->stop_update) {
+        //atomic_set(&vb->stop_once, 0);
+        queue_work(system_freezable_wq, &vb->print_val_work);
+    }
+}
+*/
+static void tpm_ctl_vq_cb(struct virtqueue *vq)
+{
+	;
+}
+
+static void tpm_cmd_vq_cb(struct virtqueue *vq)
+{
+	;
+}
+
+
+
+/*****************************tpm_crb************************************ */
 
 static const guid_t crb_acpi_start_guid =
 	GUID_INIT(0x6BBF6CAB, 0x5463, 0x4714,
@@ -91,7 +216,6 @@ enum crb_status {
 struct crb_priv {
 	u32 sm;
 	const char *hid;
-	void __iomem *iobase;
 	struct crb_regs_head __iomem *regs_h;
 	struct crb_regs_tail __iomem *regs_t;
 	u8 __iomem *cmd;
@@ -252,7 +376,7 @@ static int __crb_relinquish_locality(struct device *dev,
 	iowrite32(CRB_LOC_CTRL_RELINQUISH, &priv->regs_h->loc_ctrl);
 	if (!crb_wait_for_reg_32(&priv->regs_h->loc_state, mask, value,
 				 TPM2_TIMEOUT_C)) {
-		dev_warn(dev, "TPM_LOC_STATE_x.requestAccess timed out\n");
+		dev_warn(dev, "TPM_LOC_STATE_x.Relinquish timed out\n");
 		return -ETIME;
 	}
 
@@ -280,25 +404,47 @@ static u8 crb_status(struct tpm_chip *chip)
 
 static int crb_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 {
-	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
-	unsigned int expected;
+	struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
+    int len;
+    
+    // 从Virtio的响应队列获取数据
+    buf = (u8 *)virtqueue_get_buf(priv->response_vq, &len);
+    if (!buf) {
+        dev_err(&chip->dev, "Failed to receive response\n");
+        return -EIO;
+    }
+
+    if (count < TPM_HEADER_SIZE) {                    //依赖问题？
+        return -EIO; // 响应缓冲区太小
+    }
+
+    dev_dbg(&chip->dev, "%s %u bytes\n", __func__, len);
+
+    // 拷贝数据
+    memcpy_fromio(buf, priv->response_vq, len);
+    
+    return 0;
+	
+	//struct crb_priv *priv = dev_get_drvdata(&chip->dev);
+	//unsigned int expected;
 
 	/* A sanity check that the upper layer wants to get at least the header
 	 * as that is the minimum size for any TPM response.
 	 */
-	if (count < TPM_HEADER_SIZE)
-		return -EIO;
+	//if (count < TPM_HEADER_SIZE)
+	//	return -EIO;
 
 	/* If this bit is set, according to the spec, the TPM is in
 	 * unrecoverable condition.
 	 */
-	if (ioread32(&priv->regs_t->ctrl_sts) & CRB_CTRL_STS_ERROR)
-		return -EIO;
+	//if (ioread32(&priv->regs_t->ctrl_sts) & CRB_CTRL_STS_ERROR)
+	//	return -EIO;
 
 	/* Read the first 8 bytes in order to get the length of the response.
 	 * We read exactly a quad word in order to make sure that the remaining
 	 * reads will be aligned.
 	 */
+	/*
 	memcpy_fromio(buf, priv->rsp, 8);
 
 	expected = be32_to_cpup((__be32 *)&buf[2]);
@@ -308,6 +454,8 @@ static int crb_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 	memcpy_fromio(&buf[8], &priv->rsp[8], expected - 8);
 
 	return expected;
+	*/
+	
 }
 
 static int crb_do_acpi_start(struct tpm_chip *chip)
@@ -357,12 +505,41 @@ static int tpm_crb_smc_start(struct device *dev, unsigned long func_id)
 
 static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
 {
-	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
-	int rc = 0;
+	struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
+    struct scatterlist sg[1];
+    int rc;
+
+	/*
+    // 检查长度是否符合要求
+    if (len > priv->cmd_size) {
+        dev_err(&chip->dev, "invalid command count value %zd %d\n", len, priv->cmd_size);
+        return -E2BIG;
+    }
+	*/
+
+	dev_dbg(&chip->dev, "%s %zu bytes\n", __func__ , len);
+    // 准备发送缓冲区
+    sg_init_one(sg, buf, len);
+    virtqueue_add_inbuf(priv->request_vq, sg, 1, buf, GFP_KERNEL);
+    virtqueue_kick(priv->request_vq); // 触发传输
+
+/*
+    // 等待硬件准备好
+    rc = __crb_cmd_ready(&chip->dev, priv);
+    if (rc) {
+        dev_err(&chip->dev, "Failed to send command\n");
+        return rc;
+    }
+*/
+    return 0;
+
+	//struct crb_priv *priv = dev_get_drvdata(&chip->dev);
+	//int rc = 0;
 
 	/* Zero the cancel register so that the next command will not get
 	 * canceled.
 	 */
+	/*
 	iowrite32(0, &priv->regs_t->ctrl_cancel);
 
 	if (len > priv->cmd_size) {
@@ -372,14 +549,16 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
 	}
 
 	memcpy_toio(priv->cmd, buf, len);
+	*/
 
 	/* Make sure that cmd is populated before issuing start. */
-	wmb();
+	//wmb();
 
 	/* The reason for the extra quirk is that the PTT in 4th Gen Core CPUs
 	 * report only ACPI start but in practice seems to require both
 	 * CRB start, hence invoking CRB start method if hid == MSFT0101.
 	 */
+	/*
 	if ((priv->sm == ACPI_TPM2_COMMAND_BUFFER) ||
 	    (priv->sm == ACPI_TPM2_MEMORY_MAPPED) ||
 	    (!strcmp(priv->hid, "MSFT0101")))
@@ -395,6 +574,7 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
 	}
 
 	return rc;
+	*/
 }
 
 static void crb_cancel(struct tpm_chip *chip)
@@ -432,23 +612,93 @@ static const struct tpm_class_ops tpm_crb = {
 	.req_complete_val = CRB_DRV_STS_COMPLETE,
 };
 
+/****************************virtio****************************** */
+static int virttpm_probe(struct virtio_device *vdev)
+{
+    struct device *dev = &vdev->dev;
+	struct tpm_chip *chip = NULL;
+	struct virtio_tpm *priv;
+	struct virtqueue **vqs = NULL;
+	const char *const names[2] = { "request", "response" };
+	vq_callback_t *cbs[2] = { tpm_ctl_vq_cb, tpm_cmd_vq_cb };  //依赖问题？
+	int rc;
+
+	// sizeof(*priv) 的使用范围要看
+	// 带指针的
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv) {
+		rc = -ENOMEM;
+		// goto out;
+	}
+
+	vdev->priv = priv;
+	priv->vdev = vdev;
+	// virtio_find_single_vq/virtio_find_vqs
+	// 以上两者分别是寻找队列的接口，前者返回值是对应的队列，后者返回值是成功与否。调用的参数也不一样，后者可以指定数量。
+	rc = virtio_find_vqs(vdev, 2, vqs, cbs, names, NULL);
+	if (rc)
+		return rc;
+	// 将寻得的 vqs 对应元素赋值到 dev 对应的属性。之后在进行消息传递时，就会通过具体的 dev->request_vq
+	priv->request_vq = vqs[0];
+	priv->response_vq = vqs[1];
+
+	chip = tpmm_chip_alloc(dev, &tpm_crb);    //依赖问题？
+	if (IS_ERR(chip))
+		return PTR_ERR(chip);
+
+	dev_set_drvdata(&chip->dev, priv);
+
+	// 协商？？？这里的协商是否就是这个离线的 API ？
+	// feature 检查也可以放到 virtio_driver 结构体的 .validate 属性中。
+	// feature 检查可以替代为 TPM Capabilities 吗？不行，是另外一个层面的东西，这个需要参考其他的 virtio 设备。
+	// if (virtio_has_feature(vdev, VIRTIO_NET_F_MQ)){
+	// 	;
+	// }
+
+	virtio_device_ready(vdev);
+	
+	return 0;
+}
+
+static struct virtio_driver virtio_tpm_driver = {
+    //.feature_table = features,
+   // .feature_table_size = ARRAY_SIZE(features),
+    .driver.name =  KBUILD_MODNAME,
+    .driver.owner = THIS_MODULE,
+    .id_table = id_table,
+    //.validate = virttpm_validate,
+    .probe =    virttpm_probe,
+    .remove =   virttpm_remove,
+    //.config_changed = virttpm_changed,
+};
+
+
+/****************************virtio****************************** */
+
+
 static int crb_check_resource(struct acpi_resource *ares, void *data)
 {
-	struct resource *io_res = data;
+	struct resource *iores_array = data;
 	struct resource_win win;
 	struct resource *res = &(win.res);
+	int i;
 
 	if (acpi_dev_resource_memory(ares, res) ||
 	    acpi_dev_resource_address_space(ares, &win)) {
-		*io_res = *res;
-		io_res->name = NULL;
+		for (i = 0; i < TPM_CRB_MAX_RESOURCES + 1; ++i) {
+			if (resource_type(iores_array + i) != IORESOURCE_MEM) {
+				iores_array[i] = *res;
+				iores_array[i].name = NULL;
+				break;
+			}
+		}
 	}
 
 	return 1;
 }
 
-static void __iomem *crb_map_res(struct device *dev, struct crb_priv *priv,
-				 struct resource *io_res, u64 start, u32 size)
+static void __iomem *crb_map_res(struct device *dev, struct resource *iores,
+				 void __iomem **iobase_ptr, u64 start, u32 size)
 {
 	struct resource new_res = {
 		.start	= start,
@@ -460,10 +710,16 @@ static void __iomem *crb_map_res(struct device *dev, struct crb_priv *priv,
 	if (start != new_res.start)
 		return (void __iomem *) ERR_PTR(-EINVAL);
 
-	if (!resource_contains(io_res, &new_res))
+	if (!iores)
 		return devm_ioremap_resource(dev, &new_res);
 
-	return priv->iobase + (new_res.start - io_res->start);
+	if (!*iobase_ptr) {
+		*iobase_ptr = devm_ioremap_resource(dev, iores);
+		if (IS_ERR(*iobase_ptr))
+			return *iobase_ptr;
+	}
+
+	return *iobase_ptr + (new_res.start - iores->start);
 }
 
 /*
@@ -490,9 +746,13 @@ static u64 crb_fixup_cmd_size(struct device *dev, struct resource *io_res,
 static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 		      struct acpi_table_tpm2 *buf)
 {
-	struct list_head resources;
-	struct resource io_res;
+	struct list_head acpi_resource_list;
+	struct resource iores_array[TPM_CRB_MAX_RESOURCES + 1] = { {0} };
+	void __iomem *iobase_array[TPM_CRB_MAX_RESOURCES] = {NULL};
 	struct device *dev = &device->dev;
+	struct resource *iores;
+	void __iomem **iobase_ptr;
+	int i;
 	u32 pa_high, pa_low;
 	u64 cmd_pa;
 	u32 cmd_size;
@@ -501,21 +761,41 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 	u32 rsp_size;
 	int ret;
 
-	INIT_LIST_HEAD(&resources);
-	ret = acpi_dev_get_resources(device, &resources, crb_check_resource,
-				     &io_res);
+	INIT_LIST_HEAD(&acpi_resource_list);
+	ret = acpi_dev_get_resources(device, &acpi_resource_list,
+				     crb_check_resource, iores_array);
 	if (ret < 0)
 		return ret;
-	acpi_dev_free_resource_list(&resources);
+	acpi_dev_free_resource_list(&acpi_resource_list);
 
-	if (resource_type(&io_res) != IORESOURCE_MEM) {
+	if (resource_type(iores_array) != IORESOURCE_MEM) {
 		dev_err(dev, FW_BUG "TPM2 ACPI table does not define a memory resource\n");
 		return -EINVAL;
+	} else if (resource_type(iores_array + TPM_CRB_MAX_RESOURCES) ==
+		IORESOURCE_MEM) {
+		dev_warn(dev, "TPM2 ACPI table defines too many memory resources\n");
+		memset(iores_array + TPM_CRB_MAX_RESOURCES,
+		       0, sizeof(*iores_array));
+		iores_array[TPM_CRB_MAX_RESOURCES].flags = 0;
 	}
 
-	priv->iobase = devm_ioremap_resource(dev, &io_res);
-	if (IS_ERR(priv->iobase))
-		return PTR_ERR(priv->iobase);
+	iores = NULL;
+	iobase_ptr = NULL;
+	for (i = 0; resource_type(iores_array + i) == IORESOURCE_MEM; ++i) {
+		if (buf->control_address >= iores_array[i].start &&
+		    buf->control_address + sizeof(struct crb_regs_tail) - 1 <=
+		    iores_array[i].end) {
+			iores = iores_array + i;
+			iobase_ptr = iobase_array + i;
+			break;
+		}
+	}
+
+	priv->regs_t = crb_map_res(dev, iores, iobase_ptr, buf->control_address,
+				   sizeof(struct crb_regs_tail));
+
+	if (IS_ERR(priv->regs_t))
+		return PTR_ERR(priv->regs_t);
 
 	/* The ACPI IO region starts at the head area and continues to include
 	 * the control area, as one nice sane region except for some older
@@ -523,9 +803,10 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 	 */
 	if ((priv->sm == ACPI_TPM2_COMMAND_BUFFER) ||
 	    (priv->sm == ACPI_TPM2_MEMORY_MAPPED)) {
-		if (buf->control_address == io_res.start +
+		if (iores &&
+		    buf->control_address == iores->start +
 		    sizeof(*priv->regs_h))
-			priv->regs_h = priv->iobase;
+			priv->regs_h = *iobase_ptr;
 		else
 			dev_warn(dev, FW_BUG "Bad ACPI memory layout");
 	}
@@ -533,13 +814,6 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 	ret = __crb_request_locality(dev, priv, 0);
 	if (ret)
 		return ret;
-
-	priv->regs_t = crb_map_res(dev, priv, &io_res, buf->control_address,
-				   sizeof(struct crb_regs_tail));
-	if (IS_ERR(priv->regs_t)) {
-		ret = PTR_ERR(priv->regs_t);
-		goto out_relinquish_locality;
-	}
 
 	/*
 	 * PTT HW bug w/a: wake up the device to access
@@ -552,13 +826,26 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 	pa_high = ioread32(&priv->regs_t->ctrl_cmd_pa_high);
 	pa_low  = ioread32(&priv->regs_t->ctrl_cmd_pa_low);
 	cmd_pa = ((u64)pa_high << 32) | pa_low;
-	cmd_size = crb_fixup_cmd_size(dev, &io_res, cmd_pa,
-				      ioread32(&priv->regs_t->ctrl_cmd_size));
+	cmd_size = ioread32(&priv->regs_t->ctrl_cmd_size);
+
+	iores = NULL;
+	iobase_ptr = NULL;
+	for (i = 0; iores_array[i].end; ++i) {
+		if (cmd_pa >= iores_array[i].start &&
+		    cmd_pa <= iores_array[i].end) {
+			iores = iores_array + i;
+			iobase_ptr = iobase_array + i;
+			break;
+		}
+	}
+
+	if (iores)
+		cmd_size = crb_fixup_cmd_size(dev, iores, cmd_pa, cmd_size);
 
 	dev_dbg(dev, "cmd_hi = %X cmd_low = %X cmd_size %X\n",
 		pa_high, pa_low, cmd_size);
 
-	priv->cmd = crb_map_res(dev, priv, &io_res, cmd_pa, cmd_size);
+	priv->cmd = crb_map_res(dev, iores, iobase_ptr,	cmd_pa, cmd_size);
 	if (IS_ERR(priv->cmd)) {
 		ret = PTR_ERR(priv->cmd);
 		goto out;
@@ -566,11 +853,25 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
 
 	memcpy_fromio(&__rsp_pa, &priv->regs_t->ctrl_rsp_pa, 8);
 	rsp_pa = le64_to_cpu(__rsp_pa);
-	rsp_size = crb_fixup_cmd_size(dev, &io_res, rsp_pa,
-				      ioread32(&priv->regs_t->ctrl_rsp_size));
+	rsp_size = ioread32(&priv->regs_t->ctrl_rsp_size);
+
+	iores = NULL;
+	iobase_ptr = NULL;
+	for (i = 0; resource_type(iores_array + i) == IORESOURCE_MEM; ++i) {
+		if (rsp_pa >= iores_array[i].start &&
+		    rsp_pa <= iores_array[i].end) {
+			iores = iores_array + i;
+			iobase_ptr = iobase_array + i;
+			break;
+		}
+	}
+
+	if (iores)
+		rsp_size = crb_fixup_cmd_size(dev, iores, rsp_pa, rsp_size);
 
 	if (cmd_pa != rsp_pa) {
-		priv->rsp = crb_map_res(dev, priv, &io_res, rsp_pa, rsp_size);
+		priv->rsp = crb_map_res(dev, iores, iobase_ptr,
+					rsp_pa, rsp_size);
 		ret = PTR_ERR_OR_ZERO(priv->rsp);
 		goto out;
 	}
@@ -619,12 +920,16 @@ static int crb_acpi_add(struct acpi_device *device)
 
 	/* Should the FIFO driver handle this? */
 	sm = buf->start_method;
-	if (sm == ACPI_TPM2_MEMORY_MAPPED)
-		return -ENODEV;
+	if (sm == ACPI_TPM2_MEMORY_MAPPED) {
+		rc = -ENODEV;
+		goto out;
+	}
 
 	priv = devm_kzalloc(dev, sizeof(struct crb_priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
+	if (!priv) {
+		rc = -ENOMEM;
+		goto out;
+	}
 
 	if (sm == ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC) {
 		if (buf->header.length < (sizeof(*buf) + sizeof(*crb_smc))) {
@@ -632,7 +937,8 @@ static int crb_acpi_add(struct acpi_device *device)
 				FW_BUG "TPM2 ACPI table has wrong size %u for start method type %d\n",
 				buf->header.length,
 				ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC);
-			return -EINVAL;
+			rc = -EINVAL;
+			goto out;
 		}
 		crb_smc = ACPI_ADD_PTR(struct tpm2_crb_smc, buf, sizeof(*buf));
 		priv->smc_func_id = crb_smc->smc_func_id;
@@ -643,17 +949,23 @@ static int crb_acpi_add(struct acpi_device *device)
 
 	rc = crb_map_io(device, priv, buf);
 	if (rc)
-		return rc;
+		goto out;
 
 	chip = tpmm_chip_alloc(dev, &tpm_crb);
-	if (IS_ERR(chip))
-		return PTR_ERR(chip);
+	if (IS_ERR(chip)) {
+		rc = PTR_ERR(chip);
+		goto out;
+	}
 
 	dev_set_drvdata(&chip->dev, priv);
 	chip->acpi_dev_handle = device->handle;
 	chip->flags = TPM_CHIP_FLAG_TPM2;
 
-	return tpm_chip_register(chip);
+	rc = tpm_chip_register(chip);
+
+out:
+	acpi_put_table((struct acpi_table_header *)buf);
+	return rc;
 }
 
 static int crb_acpi_remove(struct acpi_device *device)
