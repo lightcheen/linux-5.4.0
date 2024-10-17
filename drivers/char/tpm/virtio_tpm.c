@@ -14,7 +14,8 @@
 
 struct virtio_tpm {
     struct virtio_device *vdev;
-    struct virtqueue *send_vq;
+    struct virtqueue *request_vq;
+    struct virtqueue *response_vq;
 
     struct work_struct print_val_work;
     bool stop_update;
@@ -43,17 +44,18 @@ static void tpm_ack(struct virtqueue *vq)
 
 static int init_vqs(struct virtio_tpm *vb)
 {
-    struct virtqueue *vqs[1];
+    struct virtqueue *vqs[2];
     vq_callback_t *callbacks[] = { tpm_ack };
-    static const char * const names[] = { "print"};
+    static const char * const names[] = { "request","response"};
     int err, nvqs;
 
-    nvqs = 0 ;             //virtio_has_feature(vb->vdev, VIRTIO_tpm_F_CAN_PRINT) ? 1 : 0;
+    nvqs = 2 ;             //virtio_has_feature(vb->vdev, VIRTIO_tpm_F_CAN_PRINT) ? 1 : 0;
     err = virtio_find_vqs(vb->vdev, nvqs, vqs, callbacks, names, NULL);
     if (err)
         return err;
 
-    vb->send_vq = vqs[0];
+    vb->request_vq = vqs[0];
+    vb->response_vq = vqs[1];
 
     printk("***********virtio init_vqs\n");
 
@@ -93,7 +95,7 @@ static void print_val_func(struct work_struct *work)
     vb = container_of(work, struct virtio_tpm, print_val_work);
     printk("virttpm get config change\n");
 
-    struct virtqueue *vq = vb->send_vq;
+    struct virtqueue *vq = vb->request_vq;
     vb->num[0]++;
     sg_init_one(&sg, &vb->num[0], sizeof(vb->num[0]));
 
@@ -108,7 +110,7 @@ static void tpm_send(struct virtio_tpm *vb)
     int err;
 
     printk("***********virtio tpm_send\n");
-    struct virtqueue *vq = vb->send_vq;
+    struct virtqueue *vq = vb->request_vq;
 
     vb->num[0]++;
     sg_init_one(sg, &vb->num[0], sizeof(vb->num[0]));
