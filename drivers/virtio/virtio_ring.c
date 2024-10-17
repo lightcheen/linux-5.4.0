@@ -428,6 +428,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	int head;
 	bool indirect;
 
+	printk("***************virtqueue_add_split\n");
+
 	START_USE(vq);
 
 	BUG_ON(data == NULL);
@@ -435,6 +437,9 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	if (unlikely(vq->broken)) {
 		END_USE(vq);
+
+		printk("***************virtqueue_add_split unlikely(vq->broken\n");
+
 		return -EIO;
 	}
 
@@ -475,9 +480,13 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		if (indirect)
 			kfree(desc);
 		END_USE(vq);
+
+		printk("***************virtqueue_add_split (vq->vq.num_free < descs_used) \n");
+
 		return -ENOSPC;
 	}
 
+	printk("***************virtqueue_add_split befor for out_sgs\n");
 	for (n = 0; n < out_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE);
@@ -491,6 +500,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			i = virtio16_to_cpu(_vq->vdev, desc[i].next);
 		}
 	}
+
+	printk("***************virtqueue_add_split befor for out_sgs + in_sgs\n");
 	for (; n < (out_sgs + in_sgs); n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
@@ -507,6 +518,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	/* Last one doesn't continue. */
 	desc[prev].flags &= cpu_to_virtio16(_vq->vdev, ~VRING_DESC_F_NEXT);
 
+	printk("***************virtqueue_add_split befor if indirect\n");
 	if (indirect) {
 		/* Now that the indirect table is filled in, map it. */
 		dma_addr_t addr = vring_map_single(
@@ -561,6 +573,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	 * just in case. */
 	if (unlikely(vq->num_added == (1 << 16) - 1))
 		virtqueue_kick(_vq);
+
+	printk("***************virtqueue_add_split before return 0\n");
 
 	return 0;
 
@@ -1104,6 +1118,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 	__le16 uninitialized_var(head_flags), flags;
 	u16 head, id, uninitialized_var(prev), curr, avail_used_flags;
 
+	printk("******************virtqueue_add_packed\n");
+
 	START_USE(vq);
 
 	BUG_ON(data == NULL);
@@ -1111,6 +1127,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 
 	if (unlikely(vq->broken)) {
 		END_USE(vq);
+		printk("******************virtqueue_add_packed unlikely(vq->broken) error\n");
+
 		return -EIO;
 	}
 
@@ -1118,9 +1136,13 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 
 	BUG_ON(total_sg == 0);
 
+	printk("******************virtqueue_add_packed BUG_ON\n");
+
 	if (virtqueue_use_indirect(_vq, total_sg))
 		return virtqueue_add_indirect_packed(vq, sgs, total_sg,
 				out_sgs, in_sgs, data, gfp);
+
+	printk("******************virtqueue_add_packed virtqueue_use_indirect(_vq, total_sg)\n");
 
 	head = vq->packed.next_avail_idx;
 	avail_used_flags = vq->packed.avail_used_flags;
@@ -1131,10 +1153,15 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 	i = head;
 	descs_used = total_sg;
 
+	printk("******************virtqueue_add_packed descs_used = total_sg\n");
+
 	if (unlikely(vq->vq.num_free < descs_used)) {
 		pr_debug("Can't add buf len %i - avail = %i\n",
 			 descs_used, vq->vq.num_free);
 		END_USE(vq);
+
+		printk("******************virtqueue_add_packed unlikely(vq->vq.num_free < descs_used)\n");
+
 		return -ENOSPC;
 	}
 
@@ -1143,6 +1170,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 
 	curr = id;
 	c = 0;
+
+	printk("******************virtqueue_add_packed before for\n");
 	for (n = 0; n < out_sgs + in_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			dma_addr_t addr = vring_map_one_sg(vq, sg, n < out_sgs ?
@@ -1180,6 +1209,8 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 		}
 	}
 
+	printk("******************virtqueue_add_packed after for\n");
+
 	if (i < head)
 		vq->packed.avail_wrap_counter ^= 1;
 
@@ -1204,9 +1235,11 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 	virtio_wmb(vq->weak_barriers);
 	vq->packed.vring.desc[head].flags = head_flags;
 	vq->num_added += descs_used;
-
+	
 	pr_debug("Added buffer head %i to %p\n", head, vq);
 	END_USE(vq);
+
+	printk("******************virtqueue_add_packed befor return 0\n");
 
 	return 0;
 
@@ -1224,6 +1257,8 @@ unmap_release:
 		if (i >= vq->packed.vring.num)
 			i = 0;
 	}
+
+	printk("******************virtqueue_add_packed unmap_release\n");
 
 	END_USE(vq);
 	return -EIO;
