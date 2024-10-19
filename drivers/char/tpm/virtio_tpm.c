@@ -112,16 +112,16 @@ static void print_val_func(struct work_struct *work)
     virtqueue_kick(vq);
 }
 
-static int test_send(struct virtio_tpm *vb)
+static int test_send(void)
 {
     struct scatterlist sg[1];
     int err;
 
     printk("***********virtio virtio_send\n");
-    struct virtqueue *vq = vb->request_vq;
+    struct virtqueue *vq = vb_dev->request_vq;
 
-    vb->num[0]++;
-    sg_init_one(sg, &vb->num[0], sizeof(vb->num[0]));
+    vb_dev->num[0]++;
+    sg_init_one(sg, &vb_dev->num[0], sizeof(vb_dev->num[0]));
 
     printk("***********virtio virtio_send num\n");
 
@@ -131,7 +131,7 @@ static int test_send(struct virtio_tpm *vb)
         printk("*************vq is ok\n");
     }
 
-    if(!vb){
+    if(!vb_dev){
         printk("*************vb is NULL\n");
     }else{
         printk("*************vb is ok\n");
@@ -143,7 +143,7 @@ static int test_send(struct virtio_tpm *vb)
         printk("*************sg is ok\n");
     }
 
-    err = virtqueue_add_inbuf(vq, sg, 1, vb, GFP_KERNEL);
+    err = virtqueue_add_inbuf(vq, sg, 1, vb_dev, GFP_KERNEL);
 
     if(err){
         printk("************virtqueue_add_inbuf error :%d\n",err);
@@ -166,54 +166,45 @@ static int test_send(struct virtio_tpm *vb)
 
 static int virtio_tpm_send(struct tpm_chip *chip, u8 *buf, size_t len)
 {
-	struct virtio_tpm *priv;
 	struct scatterlist sg[1];
+    struct virtqueue *vq = vb_dev->request_vq;
 	int err;
 
     printk("**************virtio_tpm_send begin\n");
-    if(!priv){
-        printk("**************virtio_tpm_send priv NULL\n");
-    }
 
-    priv = kmalloc(sizeof(*priv), GFP_KERNEL);
-    if(!priv){
-        printk("**************virtio_tpm_send kmalloc priv NULL\n");
-    }
+    if (len > TPM_BUFSIZE) {
+        printk("*********virtio_tpm_send len :%zd .len > TPM_BUFSIZE\n",len);
+		//dev_err(&chip->dev, "invalid command count value %zd %d\n",len, priv->cmd_size);
+		return -E2BIG;
+	}
 
-    priv = dev_get_drvdata(&chip->dev);
-    if(!priv){
-        printk("**************virtio_tpm_send dev_get_drvdata priv NULL\n");
-    }
-
-	dev_dbg(&chip->dev, "%s %zu bytes\n", __func__ , len);
-	sg_init_one(sg, buf, TPM_BUFSIZE);
+	sg_init_one(sg, buf, len);
 	
     printk("***************virtio_tpm_send buf :%s\n",buf);
-    if(!priv->request_vq){
-        printk("**************virtio_tpm_send  priv->request_vq NULL\n");
+    if(!vq){
+        printk("**************virtio_tpm_send vq NULL\n");
     }
-	err = virtqueue_add_inbuf(priv->request_vq, sg, 1, buf, GFP_KERNEL);
+	err = virtqueue_add_inbuf(vq, sg, 1, vb_dev, GFP_KERNEL);
     printk("**************virtio_tpm_send : %d\n", err);
 
-	virtqueue_kick(priv->request_vq);
+	virtqueue_kick(vq);
 
     printk("**************virtio_tpm_send end\n");
 
 	return 0;
 }
 
+
 static int virtio_tpm_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 {
-    //是否需要init_vq
-	struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
+
+	//struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
 	int len;
 	// int ret;
 
     printk("**************virtio_tpm_recv begin\n");
-    if(!priv){
-        printk("***********virtio_tpm_recv priv is NULL\n");
-    }
-	buf = (u8 *) virtqueue_get_buf(priv->response_vq, &len);
+
+	buf = (u8 *) virtqueue_get_buf(vb_dev->response_vq, &len);
     printk("***************virtio_tpm_recv buf :%s\n",buf);
 
 	dev_dbg(&chip->dev, "%s %u bytes\n", __func__, len);
@@ -328,7 +319,7 @@ static int virttpm_probe(struct virtio_device *vdev)
     vb_dev = vb;
 
     find_acpi_device_by_id("MSFT0101");
-    //test_send(vb);
+    //test_send();
 
     return 0;
 

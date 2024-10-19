@@ -20,6 +20,7 @@
 #include <linux/arm-smccc.h>
 #endif
 #include "tpm.h"
+#include "tpm_crb.h"
 
 #define ACPI_SIG_TPM2 "TPM2"
 
@@ -83,6 +84,7 @@ struct crb_regs_tail {
 	u32 ctrl_rsp_size;
 	u64 ctrl_rsp_pa;
 } __packed;
+
 
 enum crb_status {
 	CRB_DRV_STS_COMPLETE	= BIT(0),
@@ -163,7 +165,7 @@ static int __crb_go_idle(struct device *dev, struct crb_priv *priv)
 	return 0;
 }
 
-static int crb_go_idle(struct tpm_chip *chip)
+int crb_go_idle(struct tpm_chip *chip)
 {
 	struct device *dev = &chip->dev;
 	struct crb_priv *priv = dev_get_drvdata(dev);
@@ -205,7 +207,7 @@ static int __crb_cmd_ready(struct device *dev, struct crb_priv *priv)
 	return 0;
 }
 
-static int crb_cmd_ready(struct tpm_chip *chip)
+int crb_cmd_ready(struct tpm_chip *chip)
 {
 	struct device *dev = &chip->dev;
 	struct crb_priv *priv = dev_get_drvdata(dev);
@@ -232,7 +234,7 @@ static int __crb_request_locality(struct device *dev,
 	return 0;
 }
 
-static int crb_request_locality(struct tpm_chip *chip, int loc)
+int crb_request_locality(struct tpm_chip *chip, int loc)
 {
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 
@@ -259,14 +261,14 @@ static int __crb_relinquish_locality(struct device *dev,
 	return 0;
 }
 
-static int crb_relinquish_locality(struct tpm_chip *chip, int loc)
+int crb_relinquish_locality(struct tpm_chip *chip, int loc)
 {
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 
 	return __crb_relinquish_locality(&chip->dev, priv, loc);
 }
 
-static u8 crb_status(struct tpm_chip *chip)
+u8 crb_status(struct tpm_chip *chip)
 {
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 	u8 sts = 0;
@@ -357,6 +359,7 @@ static int tpm_crb_smc_start(struct device *dev, unsigned long func_id)
 
 static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
 {
+	
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 	int rc = 0;
 
@@ -397,7 +400,7 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
 	return rc;
 }
 
-static void crb_cancel(struct tpm_chip *chip)
+void crb_cancel(struct tpm_chip *chip)
 {
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 
@@ -409,7 +412,7 @@ static void crb_cancel(struct tpm_chip *chip)
 		dev_err(&chip->dev, "ACPI Start failed\n");
 }
 
-static bool crb_req_canceled(struct tpm_chip *chip, u8 status)
+bool crb_req_canceled(struct tpm_chip *chip, u8 status)
 {
 	struct crb_priv *priv = dev_get_drvdata(&chip->dev);
 	u32 cancel = ioread32(&priv->regs_t->ctrl_cancel);
@@ -609,6 +612,8 @@ static int crb_acpi_add(struct acpi_device *device)
 	acpi_status status;
 	u32 sm;
 	int rc;
+
+	printk("**************************tpm_crb load");
 
 	status = acpi_get_table(ACPI_SIG_TPM2, 1,
 				(struct acpi_table_header **) &buf);
