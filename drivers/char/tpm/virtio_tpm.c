@@ -10,12 +10,18 @@
 #include <linux/mm.h>
 #include <linux/mount.h>
 #include <linux/magic.h>
+#include <linux/tpm.h>
+#include "tpm.h"
+#include "tpm_crb.h"
+
+#include <linux/device.h>
+#include <linux/acpi.h>
+#include <linux/kernel.h>
 
 
 struct virtio_tpm {
     struct virtio_device *vdev;
-    struct virtqueue *request_vq;
-    struct virtqueue *response_vq;
+    struct virtqueue *data_vq;
 
     struct work_struct print_val_work;
     bool stop_update;
@@ -44,23 +50,23 @@ static void tpm_ack(struct virtqueue *vq)
 
 static int init_vqs(struct virtio_tpm *vb)
 {
-    struct virtqueue *vqs[2];
+    struct virtqueue *vqs[1];
     vq_callback_t *callbacks[] = { tpm_ack };
-    static const char * const names[] = { "request","response"};
+    static const char * const names[] = { "data"};
     int err, nvqs;
 
-    nvqs = 2 ;             //virtio_has_feature(vb->vdev, VIRTIO_tpm_F_CAN_PRINT) ? 1 : 0;
+    nvqs = 1 ;             //virtio_has_feature(vb->vdev, VIRTIO_tpm_F_CAN_PRINT) ? 1 : 0;
     err = virtio_find_vqs(vb->vdev, nvqs, vqs, callbacks, names, NULL);
     if (err)
         return err;
 
-    vb->request_vq = vqs[0];
-    vb->response_vq = vqs[1];
+    vb->data_vq = vqs[0];
 
     printk("***********virtio init_vqs\n");
 
     return 0;
 }
+
 
 static void remove_common(struct virtio_tpm *vb)
 {
@@ -95,7 +101,7 @@ static void print_val_func(struct work_struct *work)
     vb = container_of(work, struct virtio_tpm, print_val_work);
     printk("virttpm get config change\n");
 
-    struct virtqueue *vq = vb->request_vq;
+    struct virtqueue *vq = vb->data_vq;
     vb->num[0]++;
     sg_init_one(&sg, &vb->num[0], sizeof(vb->num[0]));
 
@@ -104,18 +110,18 @@ static void print_val_func(struct work_struct *work)
     virtqueue_kick(vq);
 }
 
-static void tpm_send(struct virtio_tpm *vb)
+static int test_send(void)
 {
     struct scatterlist sg[1];
     int err;
 
-    printk("***********virtio tpm_send\n");
-    struct virtqueue *vq = vb->request_vq;
+    printk("***********virtio virtio_send\n");
+    struct virtqueue *vq = vb_dev->data_vq;
 
-    vb->num[0]++;
-    sg_init_one(sg, &vb->num[0], sizeof(vb->num[0]));
+    vb_dev->num[0]++;
+    sg_init_one(sg, &vb_dev->num[0], sizeof(vb_dev->num[0]));
 
-    printk("***********virtio tpm_send num\n");
+    printk("***********virtio virtio_send num\n");
 
     if(!vq){
         printk("*************vq is NULL\n");
@@ -123,7 +129,7 @@ static void tpm_send(struct virtio_tpm *vb)
         printk("*************vq is ok\n");
     }
 
-    if(!vb){
+    if(!vb_dev){
         printk("*************vb is NULL\n");
     }else{
         printk("*************vb is ok\n");
@@ -135,7 +141,7 @@ static void tpm_send(struct virtio_tpm *vb)
         printk("*************sg is ok\n");
     }
 
-    err = virtqueue_add_inbuf(vq, sg, 1, vb, GFP_KERNEL);
+    err = virtqueue_add_inbuf(vq, sg, 1, vb_dev, GFP_KERNEL);
 
     if(err){
         printk("************virtqueue_add_inbuf error :%d\n",err);
@@ -143,7 +149,7 @@ static void tpm_send(struct virtio_tpm *vb)
         printk("************virtqueue_add_inbuf ok : %d\n",err);
     }
 
-    printk("***********virtio tpm_send add_inbuf\n");
+    printk("***********virtio virtio_send add_inbuf\n");
 
     if(virtqueue_kick(vq)){
         printk("*************virtqueue_kick error\n");
@@ -151,9 +157,89 @@ static void tpm_send(struct virtio_tpm *vb)
         printk("*************virtqueue_kick ok\n");
     }
 
-    printk("***********virtio tpm_send kick\n");
+    printk("***********virtio virtio_send kick\n");
+    return 0;
 
 }
+
+static int virtio_tpm_send(struct tpm_chip *chip, u8 *buf, size_t len)
+{
+	struct scatterlist sg[1];
+    struct virtqueue *vq = vb_dev->data_vq;
+	int err;
+
+    printk("**************virtio_tpm_send begin\n");
+
+    if (len > TPM_BUFSIZE) {
+        printk("*********virtio_tpm_send len :%zd .len > TPM_BUFSIZE\n",len);
+		//dev_err(&chip->dev, "invalid command count value %zd %d\n",len, priv->cmd_size);
+		return -E2BIG;
+	}
+
+	sg_init_one(sg, buf, len);
+	
+    printk("***************virtio_tpm_send buf :%s\n",buf);
+    if(!vq){
+        printk("**************virtio_tpm_send vq NULL\n");
+    }
+	err = virtqueue_add_inbuf(vq, sg, 1, vb_dev, GFP_KERNEL);
+    printk("**************virtio_tpm_send : %d\n", err);
+
+	virtqueue_kick(vq);
+
+    printk("**************virtio_tpm_send end\n");
+
+	return 0;
+}
+
+
+static int virtio_tpm_recv(struct tpm_chip *chip, u8 *buf, size_t count)
+{
+
+	//struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
+	int len;
+	// int ret;
+
+    printk("**************virtio_tpm_recv begin\n");
+
+	buf = (u8 *) virtqueue_get_buf(vb_dev->data_vq, &len);
+    printk("***************virtio_tpm_recv buf :%s\n",buf);
+
+	dev_dbg(&chip->dev, "%s %u bytes\n", __func__, len);
+
+    //send to tpm
+    struct crb_priv *priv = dev_get_drvdata(&chip->dev);
+	unsigned int expected;
+
+	/* A sanity check that the upper layer wants to get at least the header
+	 * as that is the minimum size for any TPM response.
+	 */
+	if (count < TPM_HEADER_SIZE)
+		return -EIO;
+
+	/* If this bit is set, according to the spec, the TPM is in
+	 * unrecoverable condition.
+	 */
+	if (ioread32(&priv->regs_t->ctrl_sts) & CRB_CTRL_STS_ERROR)
+		return -EIO;
+
+	/* Read the first 8 bytes in order to get the length of the response.
+	 * We read exactly a quad word in order to make sure that the remaining
+	 * reads will be aligned.
+	 */
+	memcpy_fromio(buf, priv->rsp, 8);
+
+	expected = be32_to_cpup((__be32 *)&buf[2]);
+	if (expected > count || expected < TPM_HEADER_SIZE)
+		return -EIO;
+
+	memcpy_fromio(&buf[8], &priv->rsp[8], expected - 8);
+
+    printk("**************virtio_tpm_recv end\n");
+
+	return expected;
+}
+
 
 static void virttpm_changed(struct virtio_device *vdev)
 {
@@ -163,6 +249,68 @@ static void virttpm_changed(struct virtio_device *vdev)
         //atomic_set(&vb->stop_once, 0);
         queue_work(system_freezable_wq, &vb->print_val_work);
     }
+}
+
+enum crb_status {
+	CRB_DRV_STS_COMPLETE	= BIT(0),
+};
+
+static const struct tpm_class_ops tpm_crb_new = {
+	.flags = TPM_OPS_AUTO_STARTUP,
+	.status = crb_status,
+	.recv = virtio_tpm_recv,
+	.send = virtio_tpm_send,
+	.cancel = crb_cancel,
+	.req_canceled = crb_req_canceled,
+	.go_idle  = crb_go_idle,
+	.cmd_ready = crb_cmd_ready,
+	.request_locality = crb_request_locality,
+	.relinquish_locality = crb_relinquish_locality,
+	.req_complete_mask = CRB_DRV_STS_COMPLETE,
+	.req_complete_val = CRB_DRV_STS_COMPLETE,
+};
+
+// 回调函数，用于在遍历过程中处理每个设备
+static acpi_status acpi_device_callback(acpi_handle handle, u32 level, void *context, void **retval) {
+    struct acpi_device *device = NULL;
+
+    printk("***************acpi_device_callback\n");
+    // 获取acpi_device
+    if (acpi_bus_get_device(handle, &device) == AE_OK) {
+        printk("***************acpi_bus_get_device\n");
+        pr_info("ACPI Device found: %s\n", acpi_device_hid(device));
+        if (!strcmp(acpi_device_hid(device), (char *)context)) {
+            pr_info("Matched device: %s\n", acpi_device_hid(device));
+
+            struct device *dev = &device->dev;
+	        struct tpm_chip *chip = dev_get_drvdata(dev);
+
+            chip->ops = &tpm_crb_new;
+            printk("************change crb send");
+
+            *retval = device;
+            return AE_CTRL_TERMINATE;  // 找到设备，停止遍历
+        }
+    }
+    return AE_OK;
+}
+
+// 查找指定ACPI ID的设备
+struct acpi_device *find_acpi_device_by_id(const char *acpi_id) {
+    struct acpi_device *device = NULL;
+
+    printk("***************find_acpi_device_by_id\n");
+    // 遍历ACPI namespace以找到匹配的设备
+    acpi_walk_namespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT, ACPI_UINT32_MAX,
+                        acpi_device_callback, NULL, (void *)acpi_id, (void **)&device);
+
+    if (device) {
+        pr_info("Found ACPI device with ID: %s\n", acpi_id);
+    } else {
+        pr_err("No ACPI device found with ID: %s\n", acpi_id);
+    }
+
+    return device;
 }
 
 static int virttpm_probe(struct virtio_device *vdev)
@@ -196,7 +344,8 @@ static int virttpm_probe(struct virtio_device *vdev)
     atomic_set(&vb->stop_once, 0);
     vb_dev = vb;
 
-    tpm_send(vb);
+    find_acpi_device_by_id("MSFT0101");
+    //test_send();
 
     return 0;
 
