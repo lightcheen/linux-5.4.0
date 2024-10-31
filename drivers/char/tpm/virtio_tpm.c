@@ -195,49 +195,32 @@ static int virtio_tpm_send(struct tpm_chip *chip, u8 *buf, size_t len)
 
 static int virtio_tpm_recv(struct tpm_chip *chip, u8 *buf, size_t count)
 {
-
+    printk("**************virtio_tpm_recv begin\n");
 	//struct virtio_tpm *priv = dev_get_drvdata(&chip->dev);
 	int len;
-	// int ret;
-
-    printk("**************virtio_tpm_recv begin\n");
-
-	buf = (u8 *) virtqueue_get_buf(vb_dev->data_vq, &len);
-    printk("***************virtio_tpm_recv buf :%s\n",buf);
+    int y=1;
+    int i;
+    while (y==1 && !virtqueue_is_broken(vb_dev->data_vq)){
+        buf = (u8 *) virtqueue_get_buf(vb_dev->data_vq, &len);
+        if(!buf){
+            y=0;
+            break;
+        }
+        printk("virtio_tpm_recv len : %zd\n",len);
+        for(i=0 ; i<len ; i++){
+            if(i%16 == 0){
+                printk(KERN_CONT "\n");
+            }
+            printk(KERN_CONT "%02x ",buf[i]);
+        }
+        printk("\n");
+   }
 
 	dev_dbg(&chip->dev, "%s %u bytes\n", __func__, len);
 
-    //send to tpm
-    struct crb_priv *priv = dev_get_drvdata(&chip->dev);
-	unsigned int expected;
-
-	/* A sanity check that the upper layer wants to get at least the header
-	 * as that is the minimum size for any TPM response.
-	 */
-	if (count < TPM_HEADER_SIZE)
-		return -EIO;
-
-	/* If this bit is set, according to the spec, the TPM is in
-	 * unrecoverable condition.
-	 */
-	if (ioread32(&priv->regs_t->ctrl_sts) & CRB_CTRL_STS_ERROR)
-		return -EIO;
-
-	/* Read the first 8 bytes in order to get the length of the response.
-	 * We read exactly a quad word in order to make sure that the remaining
-	 * reads will be aligned.
-	 */
-	memcpy_fromio(buf, priv->rsp, 8);
-
-	expected = be32_to_cpup((__be32 *)&buf[2]);
-	if (expected > count || expected < TPM_HEADER_SIZE)
-		return -EIO;
-
-	memcpy_fromio(&buf[8], &priv->rsp[8], expected - 8);
-
     printk("**************virtio_tpm_recv end\n");
 
-	return expected;
+	return len;
 }
 
 
